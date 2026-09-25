@@ -582,7 +582,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                                   kvalues_iq4nl[bitfieldExtract(vui, 8, 4)]);
             buf_a[buf_idx + 8] = d * FLOAT_TYPEV2(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)],
                                                   kvalues_iq4nl[vui >> 12]);
-#elif defined(DATA_A_MXFP4) || defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
+#elif defined(DATA_A_MXFP4) || defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST) || defined(DATA_A_ROCMI4)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
 
@@ -605,6 +605,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                               float(kvalues_rocmfp4[vui2 & 0xF]) * d);
             buf_a[buf_idx + 8] = FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  >>  4]) * d,
                                               float(kvalues_rocmfp4[vui2 >>  4]) * d);
+#elif defined(DATA_A_ROCMI4)
+            const float d = ue4m3_to_fp32(data_a[ib].e);
+            buf_a[buf_idx    ] = FLOAT_TYPEV2(float(kvalues_rocmi4[vui  & 0xF]) * d,
+                                              float(kvalues_rocmi4[vui2 & 0xF]) * d);
+            buf_a[buf_idx + 8] = FLOAT_TYPEV2(float(kvalues_rocmi4[vui  >>  4]) * d,
+                                              float(kvalues_rocmi4[vui2 >>  4]) * d);
 #else
             const float d = e8m0_to_fp32(data_a[ib].e) * 0.5;
             buf_a[buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,

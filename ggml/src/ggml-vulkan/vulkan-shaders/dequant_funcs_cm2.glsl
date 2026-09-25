@@ -1340,6 +1340,25 @@ float16_t dequantFuncROCMFP4Fast(const in decodeBufROCMFP4Fast bl, const in uint
 }
 #endif
 
+#if defined(DATA_A_ROCMI4)
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMI4 {
+   block_rocmi4 block;
+};
+
+float16_t dequantFuncROCMI4(const in decodeBufROCMI4 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+    const uint iqs = idx & 0xF;
+    const uint shift = (idx & 0x10) >> 2;
+    const float d = ue4m3_to_fp32(bl.block.e);
+    uint32_t qs = bl.block.qs[iqs];
+    qs >>= shift;
+    qs &= 0xF;
+    float16_t ret = float16_t(float(kvalues_rocmi4[qs]) * d);
+    return ret;
+}
+#endif
+
 #if defined(DATA_A_ROCMFPX_FP2)
 layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP2 {
    block_rocmfpx_fp2 block;
@@ -1545,6 +1564,8 @@ f16vec4 dequantFuncROCMFPXFP8_v(const in decodeBufROCMFPXFP8 bl, const in uint b
 #define dequantFuncA dequantFuncROCMFP4
 #elif defined(DATA_A_ROCMFP4_FAST)
 #define dequantFuncA dequantFuncROCMFP4Fast
+#elif defined(DATA_A_ROCMI4)
+#define dequantFuncA dequantFuncROCMI4
 #elif defined(DATA_A_ROCMFPX_FP2)
 #define dequantFuncA dequantFuncROCMFPXFP2
 #define dequantFuncA_v dequantFuncROCMFPXFP2_v

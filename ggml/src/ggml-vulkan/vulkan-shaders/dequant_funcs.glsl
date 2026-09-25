@@ -527,6 +527,24 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_ROCMI4)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
+    return vec2(float(kvalues_rocmi4[vui & 0xF]) * d,
+                float(kvalues_rocmi4[vui >> 4]) * d);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint vui0 = uint(data_a[a_offset + ib].qs[iqs]);
+    const uint vui1 = uint(data_a[a_offset + ib].qs[iqs + 1]);
+    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
+    return vec4(float(kvalues_rocmi4[vui0 & 0xF]) * d,
+                float(kvalues_rocmi4[vui0 >> 4]) * d,
+                float(kvalues_rocmi4[vui1 & 0xF]) * d,
+                float(kvalues_rocmi4[vui1 >> 4]) * d);
+}
+#endif
+
 #if defined(DATA_A_ROCMFPX_FP2)
 int rocmfpx_fp2_decode_code(uint code) {
     return int(kvalues_rocmfpx_fp2_const[code & 3u]);

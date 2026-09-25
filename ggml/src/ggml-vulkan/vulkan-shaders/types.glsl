@@ -1750,6 +1750,22 @@ struct block_rocmfp4_fast
 #define A_TYPE block_rocmfp4_fast
 #endif
 
+struct block_rocmi4
+{
+    uint8_t qs[QUANT_K_ROCMFP4/2];
+    uint8_t e;
+};
+
+#define QUANT_K_ROCMI4 QUANT_K_ROCMFP4
+#define QUANT_R_ROCMI4 QUANT_R_ROCMFP4
+
+#if defined(DATA_A_ROCMI4)
+#define QUANT_K QUANT_K_ROCMI4
+#define QUANT_R QUANT_R_ROCMI4
+#define QUANT_AUXF 1
+#define A_TYPE block_rocmi4
+#endif
+
 #define QUANT_K_ROCMFPX_FP2 32
 #define QUANT_R_ROCMFPX_FP2 1
 #define QUANT_K_ROCMFPX_FP8 32
@@ -1814,7 +1830,7 @@ struct block_rocmfpx_fp8
 #define A_TYPE block_rocmfpx_fp8
 #endif
 
-#if defined(DATA_A_ROCMFPX_FP2) || defined(DATA_A_ROCMFPX_FP3) || defined(DATA_A_ROCMFPX_FP6) || defined(DATA_A_ROCMFPX_FP8)
+#if defined(DATA_A_ROCMFPX_FP2) || defined(DATA_A_ROCMFPX_FP3) || defined(DATA_A_ROCMFPX_FP6) || defined(DATA_A_ROCMFPX_FP8) || defined(DATA_A_ROCMI4)
 #define DATA_A_ROCMFPX_FAMILY
 #endif
 
@@ -1939,6 +1955,15 @@ shared int8_t kvalues_rocmfp4[16];
 shared float rocmfp4_ue4m3_fp32_lut[128];
 #endif
 
+#if defined(DATA_A_ROCMI4)
+const int8_t kvalues_rocmi4_const[16] = {
+    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(5), int8_t(6), int8_t(7),
+    int8_t(-8), int8_t(-7), int8_t(-6), int8_t(-5), int8_t(-4), int8_t(-3), int8_t(-2), int8_t(-1),
+};
+
+shared int8_t kvalues_rocmi4[16];
+#endif
+
 #if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
 float rocmfp4_ue4m3_to_fp32_build(uint u) {
     if (u == 0u || u == 127u) {
@@ -1973,6 +1998,11 @@ void init_iq_shmem(uvec3 wgsize)
     }
     for (uint i = gl_LocalInvocationIndex.x; i < rocmfp4_ue4m3_fp32_lut.length(); i += wgsize.x) {
         rocmfp4_ue4m3_fp32_lut[i] = rocmfp4_ue4m3_to_fp32_build(i);
+    }
+#endif
+#if defined(DATA_A_ROCMI4)
+    for (uint i = gl_LocalInvocationIndex.x; i < kvalues_rocmi4.length(); i += wgsize.x) {
+        kvalues_rocmi4[i] = kvalues_rocmi4_const[i];
     }
 #endif
 #if defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFPX_FAMILY)

@@ -35,6 +35,13 @@ FLOAT_TYPEV2 get_dm(uint ib) {
 }
 #endif
 
+#if defined(DATA_A_ROCMI4)
+FLOAT_TYPEV2 get_dm(uint ib) {
+    const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib].e));
+    return FLOAT_TYPEV2(d, d);
+}
+#endif
+
 #if defined(DATA_A_Q2_K)
 FLOAT_TYPEV2 get_dm(uint ib) {
     const uint ib_k = ib / 8;
@@ -160,7 +167,31 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e));
     return FLOAT_TYPE(cache_b_ds.x * float(q_sum) * d);
 }
-#elif defined(DATA_A_ROCMFP4)
+#endif
+
+#if defined(DATA_A_ROCMI4)
+i32vec2 repack(uint ib, uint iqs) {
+    const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
+                                      data_a[ib].qs[iqs * 4 + 1],
+                                      data_a[ib].qs[iqs * 4 + 2],
+                                      data_a[ib].qs[iqs * 4 + 3]));
+    const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
+    const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
+    return i32vec2(pack32(i8vec4(kvalues_rocmi4[i_a0.x], kvalues_rocmi4[i_a0.y], kvalues_rocmi4[i_a0.z], kvalues_rocmi4[i_a0.w])),
+                   pack32(i8vec4(kvalues_rocmi4[i_a1.x], kvalues_rocmi4[i_a1.y], kvalues_rocmi4[i_a1.z], kvalues_rocmi4[i_a1.w])));
+}
+
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const i32vec2 data_a_qs = repack(ib_a, iqs);
+
+    const int32_t q_sum = dotPacked4x8EXT(data_a_qs.x, cache_b_qs[0]) +
+                          dotPacked4x8EXT(data_a_qs.y, cache_b_qs[1]);
+
+    const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e));
+    return FLOAT_TYPE(cache_b_ds.x * float(q_sum) * d);
+}
+#endif
+#if defined(DATA_A_ROCMFP4)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     const i32vec2 data_a_qs = repack(ib_a, iqs);
 

@@ -469,6 +469,39 @@ uint rocmfpx_nearest_scale_ue4m3(float target_scale) {
 }
 #endif
 
+#if defined(DATA_A_ROCMI4)
+uint rocmi4_quantize_code(float x, float inv_scale) {
+    if (isnan(x) || isinf(x) || inv_scale <= 0.0) {
+        return 0u;
+    }
+
+    const float v = x * inv_scale;
+    // Round half away from zero to match the CPU reference (lroundf).
+    const int q = clamp(int(sign(v) * floor(abs(v) + 0.5)), -8, 7);
+    return uint(q) & 0xFu;
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    float max_abs = 0.0;
+    [[unroll]] for (uint j = 0u; j < QUANT_K_ROCMI4; ++j) {
+        max_abs = max(max_abs, abs(load_s(src_idx + j)));
+    }
+
+    const uint e = rocmfpx_nearest_scale_ue4m3(max_abs / 7.0);
+    const float d = ue4m3_to_fp32(uint8_t(e));
+    const float id = d > 0.0 ? 1.0 / d : 0.0;
+
+    data_q[dst_idx].e = uint8_t(e);
+
+    [[unroll]] for (uint j = 0u; j < QUANT_K_ROCMI4 / 2; ++j) {
+        const uint q0 = rocmi4_quantize_code(load_s(src_idx + j), id);
+        const uint q1 = rocmi4_quantize_code(load_s(src_idx + QUANT_K_ROCMI4 / 2 + j), id);
+        data_q[dst_idx].qs[j] = uint8_t(q0 | (q1 << 4));
+    }
+}
+#endif
+
 #if defined(DATA_A_ROCMFPX_FP3)
 uint rocmfpx_fp3_quantize_code(float x, float inv_scale) {
     if (inv_scale <= 0.0) {
