@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -991,6 +992,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // anchor-first block rather than skipping the anchor logit.
     const bool is_dspark;
 
+    // DFlash2 (upstream #27816): the drafter emits a selector lattice (top-k candidates and
+    // pairwise transition scores per block position) through the pre-norm output instead of logits
+    bool    is_dflash2     = false;
+    int32_t selector_top_k = 0;
+
     const int32_t * target_layer_ids   = nullptr;
     uint32_t        target_layer_ids_n = 0;
     std::vector<int32_t> target_layer_ids_adjusted;
@@ -1047,7 +1053,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
+        selector_top_k = llama_model_dflash_selector_top_k(model_dft);
+        is_dflash2     = selector_top_k > 0;
+
+        LOG_INF("%s: adding speculative implementation '%s'%s\n", __func__, common_speculative_type_to_str(type).c_str(),
+                is_dflash2 ? " (DFlash2 selector)" : "");
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
         if (target_layer_offset != 0) {
@@ -1223,7 +1233,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
             }
         }
 
@@ -1231,7 +1241,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        if (!is_dspark) {
+        if (is_dflash2) {
+            // the lattice has one row per block token and no logits rows are requested
+            llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ false);
+        } else if (!is_dspark) {
             llama_set_embeddings_pre_norm(ctx_dft, false, /*masked*/ false);
         }
         int ret = llama_decode(ctx_dft, batch);
@@ -1258,6 +1271,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_draft = common_speculative_effective_n_max(params, dp);
             const int32_t n_min   = common_speculative_effective_n_min(params, dp, n_draft);
             const float   p_min   = common_speculative_effective_p_min(params, dp);
+
+            if (is_dflash2) {
+                const float * lattice = llama_get_embeddings_pre_norm(ctx_dft);
+                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                // greedy walk: each position picks the candidate that scores best after the previous pick
+                int32_t predecessor = 0;
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    const float * row    = lattice + (size_t) (beg + i) * n_embd_dec;
+                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+
+                    predecessor = (int32_t) std::distance(scores, std::max_element(scores, scores + selector_top_k));
+                    if (p_min > 0.0f) {
+                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[predecessor]);
+                        }
+                        if (1.0f / sum < p_min) {
+                            break;
+                        }
+                    }
+                    result.push_back((llama_token) row[predecessor]);
+                }
+
+                if ((int32_t) result.size() < n_min) {
+                    result.clear();
+                }
+                continue;
+            }
 
             if (is_dspark) {
                 // DSpark predicts the next token at position zero.  Its first
