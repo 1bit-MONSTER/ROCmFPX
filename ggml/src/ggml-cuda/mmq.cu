@@ -266,7 +266,8 @@ void ggml_cuda_mul_mat_q(
             quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            // type_x: a Q4_0 expert tensor GGML_W4A4_TENSORS selects takes the W4A4 activations too
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), type_x, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -279,7 +280,7 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, type_x, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
