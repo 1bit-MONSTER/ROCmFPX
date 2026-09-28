@@ -1273,7 +1273,8 @@ common_init_result::common_init_result(common_params & params) :
             if (types[i] == COMMON_SPECULATIVE_TYPE_NONE) {
                 continue;
             }
-            if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            // draft-model methods verify against the target alone, so bounded rollback is exact for them
+            if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
                 continue;
             }
 

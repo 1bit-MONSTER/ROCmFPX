@@ -2435,6 +2435,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         return std::max<uint32_t>(524288u, n_tokens * 192 + 64u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // DFlash2's convolutions and selector are shape work rather than matmuls
+        res = std::max<uint32_t>(res, 12u*model.n_tensors());
+    }
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
