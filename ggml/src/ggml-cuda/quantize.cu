@@ -1,6 +1,50 @@
 #include "quantize.cuh"
 #include <cstdint>
+#include <cstdlib>
 
+// 32-point normalized Walsh-Hadamard, natural order, one value per lane of a 32-lane group.
+static __device__ __forceinline__ float wht32_lane(float v, const int lane) {
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        const float o = __shfl_xor_sync(0xFFFFFFFF, v, m, 32);
+        v = (lane & m) ? (o - v) : (v + o);
+    }
+    return v * 0.17677669529663687f; // 1/sqrt(32)
+}
+
+// Same transform with 4 consecutive values per thread and 8 consecutive threads per block.
+static __device__ __forceinline__ float4 wht32_quad(float4 x, const int tid8) {
+    float a = x.x + x.y, b = x.x - x.y, c = x.z + x.w, d = x.z - x.w;
+    x.x = a + c; x.z = a - c; x.y = b + d; x.w = b - d;
+#pragma unroll
+    for (int m = 1; m < 8; m <<= 1) {
+        const float ox = __shfl_xor_sync(0xFFFFFFFF, x.x, m, WARP_SIZE);
+        const float oy = __shfl_xor_sync(0xFFFFFFFF, x.y, m, WARP_SIZE);
+        const float oz = __shfl_xor_sync(0xFFFFFFFF, x.z, m, WARP_SIZE);
+        const float ow = __shfl_xor_sync(0xFFFFFFFF, x.w, m, WARP_SIZE);
+        const bool hi = tid8 & m;
+        x.x = hi ? ox - x.x : x.x + ox;
+        x.y = hi ? oy - x.y : x.y + oy;
+        x.z = hi ? oz - x.z : x.z + oz;
+        x.w = hi ? ow - x.w : x.w + ow;
+    }
+    const float k = 0.17677669529663687f;
+    return make_float4(x.x*k, x.y*k, x.z*k, x.w*k);
+}
+
+static bool ggml_cuda_q4_0_hadamard(const ggml_type type_src0) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_Q4_0_HADAMARD");
+        return e && atoi(e) != 0;
+    }();
+#if GGML_ROCMI4_W4A4
+    return on && (type_src0 == GGML_TYPE_Q4_0 || type_src0 == GGML_TYPE_Q4_0_W4A4);
+#else
+    return on && type_src0 == GGML_TYPE_Q4_0;
+#endif
+}
+
+template <bool hadamard = false>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * __restrict__ x, void * __restrict__ vy,
@@ -28,7 +72,10 @@ static __global__ void quantize_q8_1(
     const int64_t ib  = i_cont / QK8_1; // block index
     const int64_t iqs = i_cont % QK8_1; // quant index
 
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    if constexpr (hadamard) {
+        xi = wht32_lane(xi, (int) (iqs));
+    }
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -270,7 +317,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 
 // i4_grid: quantize activations onto a signed 4-bit grid and store packed
 // nibbles for the experimental gfx1151 ROCmI4 W4A4 MMQ path.
-template <mmq_q8_1_ds_layout ds_layout, bool i4_grid = false>
+template <mmq_q8_1_ds_layout ds_layout, bool i4_grid = false, bool hadamard = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -303,7 +350,10 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if constexpr (hadamard) {
+        xi = wht32_quad(xi, (int) ((iqs/4) % 8));
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -406,8 +456,11 @@ void quantize_row_q8_1_cuda(
     const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
-    quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-    GGML_UNUSED(type_src0);
+    if (ggml_cuda_q4_0_hadamard(type_src0)) {
+        quantize_q8_1<true><<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    } else {
+        quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
 }
 
 void quantize_mmq_q8_1_cuda(
@@ -421,10 +474,24 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    if (ggml_cuda_q4_0_hadamard(type_src0)) {
+#if GGML_ROCMI4_W4A4
+        const int cc_h = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (type_src0 == GGML_TYPE_Q4_0_W4A4 && GGML_CUDA_CC_IS_GFX1151(cc_h)) {
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true, true>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            return;
+        }
+#endif
+        GGML_ASSERT(mmq_get_q8_1_ds_layout(type_src0) == MMQ_Q8_1_DS_LAYOUT_DS4);
+        quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
+            <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+        return;
+    }
 #if GGML_ROCMI4_W4A4
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // Native IU4 W4A4: activations go onto the 4-bit grid up front.
-    if (type_src0 == GGML_TYPE_Q4_0_ROCMI4 && GGML_CUDA_CC_IS_GFX1151(cc)) {
+    if ((type_src0 == GGML_TYPE_Q4_0_ROCMI4 || type_src0 == GGML_TYPE_Q4_0_W4A4) && GGML_CUDA_CC_IS_GFX1151(cc)) {
         quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true>
             <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
         return;

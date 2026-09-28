@@ -5486,6 +5486,31 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT along dim 0 with a transposed src1, as in the delta-net conv input
+struct test_concat_transposed : public test_case {
+    const ggml_type type;
+    const int64_t ne_a0, n_ch, n_tok, n_seq;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne_a0, n_ch, n_tok, n_seq);
+    }
+
+    test_concat_transposed(ggml_type type = GGML_TYPE_F32, int64_t ne_a0 = 3, int64_t n_ch = 96, int64_t n_tok = 40, int64_t n_seq = 1)
+        : type(type), ne_a0(ne_a0), n_ch(n_ch), n_tok(n_tok), n_seq(n_seq) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, ne_a0, n_ch, n_seq);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type, n_ch, n_tok, n_seq);
+        ggml_set_name(b, "b");
+        ggml_tensor * bt = ggml_transpose(ctx, b);
+        ggml_set_name(bt, "b_t");
+        ggml_tensor * out = ggml_concat(ctx, a, bt, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -8824,6 +8849,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    for (int64_t n_tok : {32, 40, 100, 512}) {
+        for (int64_t n_seq : {1, 3}) {
+            test_cases.emplace_back(new test_concat_transposed(GGML_TYPE_F32, 3, 96, n_tok, n_seq));
+            test_cases.emplace_back(new test_concat_transposed(GGML_TYPE_F16, 3, 70, n_tok, n_seq));
+        }
+    }
+    test_cases.emplace_back(new test_concat_transposed(GGML_TYPE_F32, 3, 10240, 512, 1));
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
@@ -9190,6 +9222,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
+    // head_size 128, >= 16 tokens: the chunked prefill kernel on CUDA/HIP
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  16, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  33, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  64, 2, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 300, 1, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
@@ -9538,6 +9577,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // TG: n_seq_tokens=1 (autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3)); // Qwen3.8-27B prefill ubatch
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64

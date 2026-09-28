@@ -138,6 +138,51 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+#define CONCAT_T_TILE 32
+#define CONCAT_T_ROWS 8
+
+// dst[.., i1, i0] = src0[.., i1, i0] for i0 < ne00
+template <typename T>
+static __global__ void concat_t_src0(const char * src0, char * dst, int64_t ne00,
+        uint64_t nb00, uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb0, uint64_t nb1, uint64_t nb2, uint64_t nb3) {
+    const int64_t i1 = blockIdx.x, i2 = blockIdx.y, i3 = blockIdx.z;
+    for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
+        *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *(const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    }
+}
+
+// dst[.., i1, ne00 + j] = src1[.., i1, j] where src1 is contiguous along dim 1
+template <typename T>
+static __global__ void concat_t_src1(const char * src1, char * dst, int64_t ne00, int64_t ne10, int64_t ne11, int64_t ne12,
+        uint64_t nb10, uint64_t nb11, uint64_t nb12, uint64_t nb13,
+        uint64_t nb0, uint64_t nb1, uint64_t nb2, uint64_t nb3) {
+    __shared__ T tile[CONCAT_T_TILE][CONCAT_T_TILE + 1];
+    const int64_t j0  = (int64_t) blockIdx.x * CONCAT_T_TILE;
+    const int64_t i10 = (int64_t) blockIdx.y * CONCAT_T_TILE;
+    const int64_t i2  = blockIdx.z % ne12;
+    const int64_t i3  = blockIdx.z / ne12;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+
+#pragma unroll
+    for (int k = 0; k < CONCAT_T_TILE; k += CONCAT_T_ROWS) {
+        const int64_t j  = j0 + ty + k;
+        const int64_t i1 = i10 + tx;
+        if (j < ne10 && i1 < ne11) {
+            tile[ty + k][tx] = *(const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + j*nb10);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < CONCAT_T_TILE; k += CONCAT_T_ROWS) {
+        const int64_t i1 = i10 + ty + k;
+        const int64_t j  = j0 + tx;
+        if (j < ne10 && i1 < ne11) {
+            *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + (ne00 + j)*nb0) = tile[tx][ty + k];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
@@ -161,6 +206,17 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
             CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
         }
+    } else if (dim == 0 && src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T) && src1->ne[0] >= CONCAT_T_TILE &&
+               dst->nb[0] == sizeof(T)) {
+        const dim3 grid0(dst->ne[1], dst->ne[2], dst->ne[3]);
+        concat_t_src0<T><<<grid0, 64, 0, stream>>>((const char *) src0->data, (char *) dst->data, src0->ne[0],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+        const dim3 grid1((src1->ne[0] + CONCAT_T_TILE - 1) / CONCAT_T_TILE, (src1->ne[1] + CONCAT_T_TILE - 1) / CONCAT_T_TILE,
+                         src1->ne[2] * src1->ne[3]);
+        const dim3 block1(CONCAT_T_TILE, CONCAT_T_ROWS, 1);
+        concat_t_src1<T><<<grid1, block1, 0, stream>>>((const char *) src1->data, (char *) dst->data, src0->ne[0],
+            src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
     } else {
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

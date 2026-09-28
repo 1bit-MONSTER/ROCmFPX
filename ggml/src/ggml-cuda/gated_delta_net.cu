@@ -167,6 +167,127 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// Prefill variant (scalar gate, no state snapshots). Each column of the transposed
+// state is split over GDN_PF_SPLIT adjacent lanes that keep S_v/GDN_PF_SPLIT rows
+// in registers, so a token step is plain FMA chains plus a log2(GDN_PF_SPLIT)-step
+// shuffle reduction. The per-token k/q/v/g/beta are staged in shared memory
+// GDN_PF_CHUNK tokens at a time and shared by all columns of the head.
+template <int S_v, int GDN_PF_SPLIT, int GDN_PF_COLS, int GDN_PF_CHUNK>
+__global__ void __launch_bounds__(GDN_PF_COLS * GDN_PF_SPLIT)
+gated_delta_net_prefill_cuda(const float * q,
+                             const float * k,
+                             const float * v,
+                             const float * g,
+                             const float * beta,
+                             const float * curr_state,
+                             float *       dst,
+                             int64_t       H,
+                             int64_t       n_tokens,
+                             int64_t       n_seqs,
+                             int64_t       sq1,
+                             int64_t       sq2,
+                             int64_t       sq3,
+                             int64_t       sv1,
+                             int64_t       sv2,
+                             int64_t       sv3,
+                             int64_t       sb1,
+                             int64_t       sb2,
+                             int64_t       sb3,
+                             const uint3   neqk1_magic,
+                             const uint3   rq3_magic,
+                             float         scale) {
+    constexpr int ROWS     = S_v / GDN_PF_SPLIT;
+    constexpr int NTHREADS = GDN_PF_COLS * GDN_PF_SPLIT;
+
+    __shared__ float k_s[GDN_PF_CHUNK][S_v];
+    __shared__ float q_s[GDN_PF_CHUNK][S_v];
+    __shared__ float v_s[GDN_PF_CHUNK][GDN_PF_COLS];
+    __shared__ float g_s[GDN_PF_CHUNK];
+    __shared__ float b_s[GDN_PF_CHUNK];
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      tid      = threadIdx.x;
+    const int      col_loc  = tid / GDN_PF_SPLIT;
+    const int      part     = tid % GDN_PF_SPLIT;
+    const int      col0     = blockIdx.z * GDN_PF_COLS;
+    const int      col      = col0 + col_loc;
+    const int      row0     = part * ROWS;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    float *       attn_data        = dst + (sequence * n_tokens * H + h_idx) * S_v;
+    float *       state            = dst + attn_score_elems + (sequence * H + h_idx) * S_v * S_v;
+    curr_state += sequence * H * S_v * S_v + h_idx * S_v * S_v;
+
+    const float * q_base = q + iq3 * sq3 + iq1 * sq1;
+    const float * k_base = k + iq3 * sq3 + iq1 * sq1;
+    const float * v_base = v + sequence * sv3 + h_idx * sv1 + col0;
+    const float * g_base = g    + sequence * sb3 + h_idx * sb1;
+    const float * b_base = beta + sequence * sb3 + h_idx * sb1;
+
+    ggml_cuda_pdl_sync();
+
+    float s[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        s[r] = curr_state[col * S_v + row0 + r];
+    }
+
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += GDN_PF_CHUNK) {
+        const int nt = (int) min((int64_t) GDN_PF_CHUNK, n_tokens - t0);
+
+        __syncthreads();
+        for (int idx = tid; idx < nt * S_v; idx += NTHREADS) {
+            const int tt = idx / S_v;
+            const int i  = idx % S_v;
+            k_s[tt][i] = k_base[(t0 + tt) * sq2 + i];
+            q_s[tt][i] = q_base[(t0 + tt) * sq2 + i];
+        }
+        for (int idx = tid; idx < nt * GDN_PF_COLS; idx += NTHREADS) {
+            const int tt = idx / GDN_PF_COLS;
+            const int c  = idx % GDN_PF_COLS;
+            v_s[tt][c] = v_base[(t0 + tt) * sv2 + c];
+        }
+        if (tid < nt) {
+            g_s[tid] = expf(g_base[(t0 + tid) * sb2]);
+            b_s[tid] = b_base[(t0 + tid) * sb2];
+        }
+        __syncthreads();
+
+        for (int tt = 0; tt < nt; tt++) {
+            const float g_val    = g_s[tt];
+            const float beta_val = b_s[tt];
+
+            float kv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                kv[r % 4] += s[r] * k_s[tt][row0 + r];
+            }
+            const float kv_col    = warp_reduce_sum<GDN_PF_SPLIT>((kv[0] + kv[1]) + (kv[2] + kv[3]));
+            const float delta_col = (v_s[tt][col_loc] - g_val * kv_col) * beta_val;
+
+            float at[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                s[r]       = g_val * s[r] + k_s[tt][row0 + r] * delta_col;
+                at[r % 4] += s[r] * q_s[tt][row0 + r];
+            }
+            const float attn_col = warp_reduce_sum<GDN_PF_SPLIT>((at[0] + at[1]) + (at[2] + at[3]));
+            if (part == 0) {
+                attn_data[(t0 + tt) * S_v * H + col] = attn_col * scale;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        state[col * S_v + row0 + r] = s[r];
+    }
+}
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -179,6 +300,24 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
+    if constexpr (!KDA && !keep_rs_t) {
+        if (S_v == 128 && n_tokens >= 16) {
+            // 4 lanes per state column, 32 columns per block, 32-token chunks of k/q/v/g/beta in
+            // shared memory: the fastest of the layouts measured on gfx1151 (the others kept more
+            // state per lane and spilled, or reduced across more lanes).
+            constexpr int SPLIT = 4, COLS = 32, CHUNK = 32;
+            const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+            const uint3 rq3_magic   = init_fastdiv_values(rq3);
+            dim3 grid_dims(H, n_seqs, 128 / COLS);
+            dim3 block_dims(COLS * SPLIT, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(gated_delta_net_prefill_cuda<128, SPLIT, COLS, CHUNK>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            return;
+        }
+    }
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
