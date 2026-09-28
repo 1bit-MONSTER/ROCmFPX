@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cstring>
+#include <string>
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -35,6 +38,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q4_0_ROCMI4:
             mul_mat_q_case<GGML_TYPE_Q4_0_ROCMI4>(ctx, args, stream);
             break;
+#if GGML_ROCMI4_W4A4
+        case GGML_TYPE_Q4_0_W4A4:
+            mul_mat_q_case<GGML_TYPE_Q4_0_W4A4>(ctx, args, stream);
+            break;
+#endif
         case GGML_TYPE_Q3_0_ROCMFPX:
             mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, args, stream);
             break;
@@ -95,6 +103,36 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+#if GGML_ROCMI4_W4A4
+// GGML_W4A4_TENSORS: comma-separated substrings of Q4_0 weight names that take the lossy
+// IU4 W4A4 prompt path on gfx1151, or "all". Unset: none.
+static bool ggml_cuda_q4_0_w4a4_selected(const char * name) {
+    static const std::string sel = [] {
+        const char * e = getenv("GGML_W4A4_TENSORS");
+        return std::string(e ? e : "");
+    }();
+    if (sel.empty()) {
+        return false;
+    }
+    if (sel == "all") {
+        return true;
+    }
+    size_t pos = 0;
+    while (pos <= sel.size()) {
+        const size_t end = sel.find(',', pos);
+        const std::string tok = sel.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        if (!tok.empty() && strstr(name, tok.c_str()) != nullptr) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+#endif
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -145,6 +183,13 @@ void ggml_cuda_mul_mat_q(
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
 
+    ggml_type type_x = src0->type;
+#if GGML_ROCMI4_W4A4
+    if (type_x == GGML_TYPE_Q4_0 && GGML_CUDA_CC_IS_GFX1151(cc) && ggml_cuda_q4_0_w4a4_selected(src0->name)) {
+        type_x = GGML_TYPE_Q4_0_W4A4;
+    }
+#endif
+
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
@@ -160,7 +205,7 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), type_x, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -173,7 +218,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, type_x, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
