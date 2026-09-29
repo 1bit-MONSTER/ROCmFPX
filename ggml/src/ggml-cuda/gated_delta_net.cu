@@ -167,12 +167,14 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-// Prefill variant (scalar gate, no state snapshots). Each column of the transposed
+// Prefill variant (scalar gate). Each column of the transposed
 // state is split over GDN_PF_SPLIT adjacent lanes that keep S_v/GDN_PF_SPLIT rows
 // in registers, so a token step is plain FMA chains plus a log2(GDN_PF_SPLIT)-step
 // shuffle reduction. The per-token k/q/v/g/beta are staged in shared memory
-// GDN_PF_CHUNK tokens at a time and shared by all columns of the head.
-template <int S_v, int GDN_PF_SPLIT, int GDN_PF_COLS, int GDN_PF_CHUNK>
+// GDN_PF_CHUNK tokens at a time and shared by all columns of the head. With keep_rs_t it
+// also writes the state after each of the last K tokens (the same slots as gated_delta_net_cuda:
+// slot 0 = the final state, slot s = s tokens back), which speculative rollback reads.
+template <int S_v, int GDN_PF_SPLIT, int GDN_PF_COLS, int GDN_PF_CHUNK, bool keep_rs_t>
 __global__ void __launch_bounds__(GDN_PF_COLS * GDN_PF_SPLIT)
 gated_delta_net_prefill_cuda(const float * q,
                              const float * k,
@@ -195,7 +197,8 @@ gated_delta_net_prefill_cuda(const float * q,
                              int64_t       sb3,
                              const uint3   neqk1_magic,
                              const uint3   rq3_magic,
-                             float         scale) {
+                             float         scale,
+                             int           K) {
     constexpr int ROWS     = S_v / GDN_PF_SPLIT;
     constexpr int NTHREADS = GDN_PF_COLS * GDN_PF_SPLIT;
 
@@ -279,12 +282,24 @@ gated_delta_net_prefill_cuda(const float * q,
             if (part == 0) {
                 attn_data[(t0 + tt) * S_v * H + col] = attn_col * scale;
             }
+            if constexpr (keep_rs_t) {
+                const int64_t slot = n_tokens - 1 - (t0 + tt);
+                if (slot < K) {
+                    float * snap = state + slot * (S_v * S_v * H * n_seqs);
+#pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        snap[col * S_v + row0 + r] = s[r];
+                    }
+                }
+            }
         }
     }
 
+    if constexpr (!keep_rs_t) {
 #pragma unroll
-    for (int r = 0; r < ROWS; r++) {
-        state[col * S_v + row0 + r] = s[r];
+        for (int r = 0; r < ROWS; r++) {
+            state[col * S_v + row0 + r] = s[r];
+        }
     }
 }
 
@@ -300,7 +315,7 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
-    if constexpr (!KDA && !keep_rs_t) {
+    if constexpr (!KDA) {
         if (S_v == 128 && n_tokens >= 16) {
             // 4 lanes per state column, 32 columns per block, 32-token chunks of k/q/v/g/beta in
             // shared memory: the fastest of the layouts measured on gfx1151 (the others kept more
@@ -311,10 +326,10 @@ static void launch_gated_delta_net(
             dim3 grid_dims(H, n_seqs, 128 / COLS);
             dim3 block_dims(COLS * SPLIT, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-            ggml_cuda_kernel_launch(gated_delta_net_prefill_cuda<128, SPLIT, COLS, CHUNK>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_prefill_cuda<128, SPLIT, COLS, CHUNK, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
             return;
         }
     }

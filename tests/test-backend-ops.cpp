@@ -9228,6 +9228,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  64, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
+    // the chunked head-128 prefill kernel with state snapshots for speculative rollback (K > 1)
+    for (int64_t K : {2, 8, 17}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  16, 1, 1, false, false, K));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  33, 2, 1, false, false, K));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  64, 2, 1, true,  false, K));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 512, 1, 3, false, false, K));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 300, 1, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
