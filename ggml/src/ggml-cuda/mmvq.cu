@@ -1140,6 +1140,134 @@ static void mul_mat_vec_q_moe_launch(
         stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
 }
 
+
+// Q4_0 x Q8_1 for 5-8 columns on RDNA3.5 (speculative verification), found by a KernelForge
+// campaign on gfx1151 (tools/kernelforge/gemv-q4_0 in the engine). One warp computes 4 consecutive
+// rows: each column's k-block of activations is loaded once and reused by the 4 rows, and each
+// weight int is unpacked once and reused by every column. The arithmetic per (row, column, block)
+// and its summation order are those of vec_dot_q4_0_q8_1 in mul_mat_vec_q, and the epilogue sums
+// each result over the warp in the same butterfly order, so the output is bit for bit the same.
+// A 5120 x 17408 matrix with 8 columns: 0.298 -> 0.226 ms. Used for exactly 8 columns (a full
+// DFlash verification batch): in Qwen3.8-27B it took 8-token batches from 71.3 to 78.3 tok/s, while
+// 5-7 columns measured level or slower, so they keep mul_mat_vec_q.
+static constexpr int MMVQ_Q4_0_RT_ROWS = 4;
+
+template <int ncols_dst>
+__launch_bounds__(32, 1)
+static __global__ void mul_mat_vec_q4_0_rt(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+        const int ncols_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+    constexpr int WARP = 32;
+    constexpr int R    = MMVQ_Q4_0_RT_ROWS;
+    constexpr int VDR  = VDR_Q4_0_Q8_1_MMVQ;
+    static_assert(R * ncols_dst <= WARP, "one lane per result in the epilogue");
+
+    const int tid            = threadIdx.x;
+    const int blocks_per_row = ncols_x / QK4_0;
+    constexpr int blocks_per_iter = VDR * WARP / QI4_0;
+    const int row0 = blockIdx.x * R;
+    const int kqs  = VDR * (tid % (QI4_0 / VDR));
+
+    const block_q4_0 * x = (const block_q4_0 *) vx + (size_t) row0 * stride_row_x;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float tmp[R][ncols_dst] = {{0.0f}};
+    for (int kbx = tid / (QI4_0 / VDR); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        int    u[ncols_dst][2 * VDR];
+        float2 ds[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const block_q8_1 * bq8 = &y[(size_t) j * stride_col_y + kbx];
+#pragma unroll
+            for (int i = 0; i < VDR; ++i) {
+                u[j][2 * i + 0] = get_int_b4(bq8->qs, kqs + i);
+                u[j][2 * i + 1] = get_int_b4(bq8->qs, kqs + i + QI4_0);
+            }
+            ds[j] = __half22float2(bq8->ds);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q4_0 * bq4 = &x[(size_t) r * stride_row_x + kbx];
+            int vi0[VDR], vi1[VDR];
+#pragma unroll
+            for (int i = 0; i < VDR; ++i) {
+                const int v = get_int_b2(bq4->qs, kqs + i);
+                vi0[i] = (v >> 0) & 0x0F0F0F0F;
+                vi1[i] = (v >> 4) & 0x0F0F0F0F;
+            }
+            const float d4 = __half2float(bq4->d);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < VDR; ++i) {
+                    sumi = ggml_cuda_dp4a(vi0[i], u[j][2 * i + 0], sumi);
+                    sumi = ggml_cuda_dp4a(vi1[i], u[j][2 * i + 1], sumi);
+                }
+                tmp[r][j] += d4 * (sumi * ds[j].x - (8 * VDR / QI4_0) * ds[j].y);
+            }
+        }
+    }
+
+    if constexpr (R * ncols_dst == WARP) {
+        // one result per lane: a reduce-scatter halves the live accumulators at each xor stage (31
+        // shuffles for 32 results instead of 160) and pairs partials in the butterfly's order
+        float acc[WARP];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                acc[j * R + r] = tmp[r][j];
+            }
+        }
+#pragma unroll
+        for (int m = WARP / 2; m > 0; m >>= 1) {
+            const bool hi = (tid & m) != 0;
+#pragma unroll
+            for (int k = 0; k < m; ++k) {
+                const float a = acc[k];
+                const float b = acc[k + m];
+                acc[k] = (hi ? b : a) + __shfl_xor(hi ? a : b, m, WARP);
+            }
+        }
+        dst[(size_t) (tid / R) * stride_col_dst + row0 + (tid % R)] = acc[0];
+    } else {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                tmp[r][j] = warp_reduce_sum<WARP>(tmp[r][j]);
+            }
+        }
+        if (tid < R * ncols_dst) {
+            float v = tmp[0][0];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (tid == j * R + r) {
+                        v = tmp[r][j];
+                    }
+                }
+            }
+            dst[(size_t) (tid / R) * stride_col_dst + row0 + (tid % R)] = v;
+        }
+    }
+}
+
+static void mul_mat_vec_q4_0_rt_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    const dim3 grid(nrows_x / MMVQ_Q4_0_RT_ROWS), block(32);
+    switch (ncols_dst) {
+        case 5: mul_mat_vec_q4_0_rt<5><<<grid, block, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst); break;
+        case 6: mul_mat_vec_q4_0_rt<6><<<grid, block, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst); break;
+        case 7: mul_mat_vec_q4_0_rt<7><<<grid, block, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst); break;
+        case 8: mul_mat_vec_q4_0_rt<8><<<grid, block, 0, stream>>>(vx, vy, dst, ncols_x, stride_row_x, stride_col_y, stride_col_dst); break;
+        default: GGML_ABORT("mul_mat_vec_q4_0_rt: ncols_dst must be 5..8 (dispatched for 8)");
+    }
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1164,6 +1292,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_ids = ids != nullptr;
+
+    if constexpr (type == GGML_TYPE_Q4_0) {
+        // speculative verification batches on RDNA3.5: the row-tiled kernel above
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && warp_size == 32 && !has_ids && !has_fusion && ncols_dst == 8 &&
+                nrows_x % MMVQ_Q4_0_RT_ROWS == 0 && nchannels_x == 1 && nchannels_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1) {
+            mul_mat_vec_q4_0_rt_launch(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                                       stride_col_dst, stream);
+            return;
+        }
+    }
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
