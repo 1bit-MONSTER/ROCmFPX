@@ -178,6 +178,39 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Python/shell syntax checks | passed |
 | DiffusionGemma BF16 → ROCmFP4 coherent agent quant | passed, `13,764.94 MiB / 4.57 BPW` |
 
+## Session 003 — 2026-10-01
+
+**Scope:** Prompt-processing FlashAttention kernel for 256-wide heads on gfx1151 (Qwen3.5/3.8 full-attention layers). On RDNA3.5 these shapes fell through to `flash_attn_tile` (scalar, no WMMA): the WMMA paths stop at head size 128 and the rocWMMA path excludes RDNA3.5.
+
+### `ggml/src/ggml-cuda/fattn-onebit-d256.cu`, `fattn-onebit-d256.cuh` (new)
+
+| Change | Detail |
+|--------|--------|
+| Kernel | 8-wave workgroup = 64 GQA-packed query rows of one KV head; wave pairs split the head dimension (Q slice in registers, 64-register accumulator); 32-token K/V tiles in LDS with a conflict-free V transpose; gfx11 WMMA for Q*K and P*V; base-2 online softmax. |
+| Mask pre-pass | Per query position: first/last finite mask entry and whether the range is all zero. Workgroups visit only the union of their rows' ranges and read the mask only outside the dense intersection. |
+| Scope | RDNA3.5, F32 Q, F16 K/V, head size 256, at least 16 query rows, mask present, no sinks/ALiBi/softcap. `GGML_ONEBIT_FA256=0` disables it. |
+
+### `ggml/src/ggml-cuda/fattn.cu`
+
+| Change | Detail |
+|--------|--------|
+| Hook | Include + 4-line dispatch at the top of the HIP branch of `ggml_cuda_flash_attn_ext`. |
+
+### `tests/test-backend-ops.cpp`
+
+| Change | Detail |
+|--------|--------|
+| Cases | Four FLASH_ATTN_EXT cases at the Qwen3.5/3.8 shape: head 256, GQA 6, KV 4096/16384, batch 16/512. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 -p hsk=256` | 122/122 (kernel on and off) |
+| Qwen3.8-27B UD-Q4_K_XL, llama-bench -b 512 -ub 512 (off -> on) | pp8192 329 -> 348, pp16384 302 -> 334, pp32768 260 -> 310 tok/s |
+| Same, pp512 @ d16384 | 257 -> 307 tok/s; attention-attributable time per token 1.30 -> 0.67 ms |
+| wikitext-2, -c 16384, 2 chunks | PPL 5.4484 (tile kernel 5.5867; HRX backend 5.3543) |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD
