@@ -2296,7 +2296,8 @@ static void ggml_cuda_op_mul_mat(
                 const int64_t q_s12 = src1_needs_f32_staging ? ne11*ne10 : nb12/sizeof(float);
                 const int64_t q_s13 = src1_needs_f32_staging ? ne12*ne11*ne10 : nb13/sizeof(float);
                 quantize_src1(
-                    dev[id].src1_ddf, nullptr, dev[id].src1_ddq, src0->type, ne10,
+                    dev[id].src1_ddf, nullptr, dev[id].src1_ddq, src0->type,
+                    (src0->flags & GGML_TENSOR_FLAG_HADAMARD_Q4_0) != 0, ne10,
                     q_s11, q_s12, q_s13,
                     src1_padded_col_size, ne11, ne12, ne13, stream);
                 CUDA_CHECK(cudaGetLastError());
@@ -2399,7 +2400,8 @@ static void ggml_cuda_op_mul_mat(
 
                 if (quantize_src1 && !src1_is_contiguous && !dev[id].src1_is_staged_f32) {
                     quantize_src1(
-                        src1_ddf_i, nullptr, src1_ddq_i, src0->type, ne10, ne10, ne11*ne10, ne12*ne11*ne10,
+                        src1_ddf_i, nullptr, src1_ddq_i, src0->type,
+                        (src0->flags & GGML_TENSOR_FLAG_HADAMARD_Q4_0) != 0, ne10, ne10, ne11*ne10, ne12*ne11*ne10,
                         src1_padded_col_size, src1_ncols, 1, 1, stream);
                     CUDA_CHECK(cudaGetLastError());
                 }

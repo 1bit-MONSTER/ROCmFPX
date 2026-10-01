@@ -205,7 +205,8 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), type_x, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), type_x,
+                    (src0->flags & GGML_TENSOR_FLAG_HADAMARD_Q4_0) != 0, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -267,7 +268,8 @@ void ggml_cuda_mul_mat_q(
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
             // type_x: a Q4_0 expert tensor GGML_W4A4_TENSORS selects takes the W4A4 activations too
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), type_x, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), type_x,
+                (src0->flags & GGML_TENSOR_FLAG_HADAMARD_Q4_0) != 0, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());

@@ -1453,10 +1453,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    // a file stamped onebit.hadamard_q4_0 = 32 (the engine's tools/hadamard_q4_0.py) holds only rotated
+    // Q4_0 weights: mark them, so the backend rotates their activations and nobody else's
+    bool hadamard_q4_0 = false;
+    {
+        const int64_t kid = gguf_find_key(ml.metadata, "onebit.hadamard_q4_0");
+        if (kid >= 0) {
+            const gguf_type t = gguf_get_kv_type(ml.metadata, kid);
+            hadamard_q4_0 = (t == GGUF_TYPE_INT32  && gguf_get_val_i32(ml.metadata, kid) == 32) ||
+                            (t == GGUF_TYPE_UINT32 && gguf_get_val_u32(ml.metadata, kid) == 32);
+        }
+    }
+
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            if (hadamard_q4_0 && cur->type == GGML_TYPE_Q4_0) {
+                cur->flags |= GGML_TENSOR_FLAG_HADAMARD_Q4_0;
+            }
         }
     }
 
