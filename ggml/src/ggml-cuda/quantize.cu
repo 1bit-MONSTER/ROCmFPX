@@ -32,15 +32,18 @@ static __device__ __forceinline__ float4 wht32_quad(float4 x, const int tid8) {
     return make_float4(x.x*k, x.y*k, x.z*k, x.w*k);
 }
 
-static bool ggml_cuda_q4_0_hadamard(const ggml_type type_src0) {
-    static const bool on = [] {
+// Rotate a matmul's activations when its weights are Hadamard-rotated Q4_0: the tensor says so
+// (GGML_TENSOR_FLAG_HADAMARD_Q4_0, set by the loader for a file stamped onebit.hadamard_q4_0 = 32),
+// or GGML_Q4_0_HADAMARD=1 says every Q4_0 weight in the process is (the old, process-wide switch).
+static bool ggml_cuda_q4_0_hadamard(const ggml_type type_src0, const bool hadamard) {
+    static const bool all = [] {
         const char * e = getenv("GGML_Q4_0_HADAMARD");
         return e && atoi(e) != 0;
     }();
 #if GGML_ROCMI4_W4A4
-    return on && (type_src0 == GGML_TYPE_Q4_0 || type_src0 == GGML_TYPE_Q4_0_W4A4);
+    return (all || hadamard) && (type_src0 == GGML_TYPE_Q4_0 || type_src0 == GGML_TYPE_Q4_0_W4A4);
 #else
-    return on && type_src0 == GGML_TYPE_Q4_0;
+    return (all || hadamard) && type_src0 == GGML_TYPE_Q4_0;
 #endif
 }
 
@@ -445,7 +448,7 @@ static __global__ void quantize_mmq_q8_1(
 }
 
 void quantize_row_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0, const bool hadamard,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(!ids);
@@ -456,7 +459,7 @@ void quantize_row_q8_1_cuda(
     const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
-    if (ggml_cuda_q4_0_hadamard(type_src0)) {
+    if (ggml_cuda_q4_0_hadamard(type_src0, hadamard)) {
         quantize_q8_1<true><<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
     } else {
         quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
@@ -464,7 +467,7 @@ void quantize_row_q8_1_cuda(
 }
 
 void quantize_mmq_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0, const bool hadamard,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
@@ -474,7 +477,7 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
-    if (ggml_cuda_q4_0_hadamard(type_src0)) {
+    if (ggml_cuda_q4_0_hadamard(type_src0, hadamard)) {
 #if GGML_ROCMI4_W4A4
         const int cc_h = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (type_src0 == GGML_TYPE_Q4_0_W4A4 && GGML_CUDA_CC_IS_GFX1151(cc_h)) {
