@@ -211,6 +211,33 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Same, pp512 @ d16384 | 257 -> 307 tok/s; attention-attributable time per token 1.30 -> 0.67 ms |
 | wikitext-2, -c 16384, 2 chunks | PPL 5.4484 (tile kernel 5.5867; HRX backend 5.3543) |
 
+## Session 004 — 2026-10-01
+
+**Scope:** Opt-in sparse prefill for the gfx1151 256-wide-head attention kernel, after FlashPrefill V2 (Fan et al., arXiv:2608.19758), implemented from the paper's equations. Off by default.
+
+### `ggml/src/ggml-cuda/fattn-onebit-d256.cu`
+
+| Change | Detail |
+|--------|--------|
+| `fa256_block_means` | Mean K and V per 128-token block and KV head (16-byte loads over 8 token slots, LDS reduction). |
+| `fa256_select` | Per 64-row query tile: scores every block fully inside the rows' dense visible range against the block-mean keys (same WMMA path as Q*K), accumulates per-block energies with a running maximum, keeps blocks at or above alpha times the largest; the first 256 tokens, the 512 tokens before the diagonal and partially visible blocks are always kept. Writes a keep bitmask per workgroup. |
+| `fa256_prefill<false>` | Dense kernel plus a uniform skip of pruned blocks (keep bits staged in LDS); saves each row's softmax max and sum when sparse. |
+| `fa256_prefill<true>` | Resumes from the output and saved state and adds correction tiles: each pruned block contributes its mean K/V with the logit raised by log2(128). |
+| Switches | `GGML_ONEBIT_FLASH_PREFILL=<alpha>` (0/unset = dense), `GGML_ONEBIT_FLASH_PREFILL_MIN` (KV length, default 8192), diagnostics `_NOCORR=1`, `_STATS=1`. |
+| Register pressure | The tile body is one loop with `if constexpr` per pass; a lambda around it made the compiler spill the accumulators. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 -p hsk=256` | 122/122 (sparse does not trigger on these random masks; dense path unchanged) |
+| Standalone check vs CPU, 16K KV, block-constant K/V (mean correction exact) | rel. RMS 3.3e-4 at alpha 0.1 and 1.0, same as dense; 0.58 with the correction disabled |
+| Blocks kept at alpha 0.1 | 9-13% at 32K, 31-40% at 16K |
+| llama-server, 8 wikitext prompts of 14-28K tokens, mean prompt tok/s | tile 287, dense kernel 325, alpha 0.1: 347, alpha 0.3: 350 |
+| Passkey retrieval, 10 prompts each at ~16K and ~30K tokens | dense 20/20, alpha 0.1: 20/20, alpha 0.3: 20/20 |
+| Greedy agreement with dense over 128 tokens (8 prompts) | dense repeat 929/929; tile kernel 466/929; alpha 0.1: 93/871 |
+| wikitext-2 PPL, -c 16384, 2 chunks (every scored token from a sparse prefill) | dense 5.4484; alpha 0.1: 5.9256 (5.6062 without correction) |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD
