@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-onebit-d256.cuh"
 #include "fattn.cuh"
 #include "convert.cuh"
 
@@ -769,6 +770,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool v_is_turbo = V && ggml_type_is_turbo(V->type);
 
 #ifdef GGML_USE_HIP
+    if (ggml_cuda_fattn_onebit_d256_eligible(dst)) {
+        ggml_cuda_fattn_onebit_d256(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * Q = dst->src[0];
     const best_fattn_kernel raw_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
 

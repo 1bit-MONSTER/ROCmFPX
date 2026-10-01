@@ -178,6 +178,66 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Python/shell syntax checks | passed |
 | DiffusionGemma BF16 → ROCmFP4 coherent agent quant | passed, `13,764.94 MiB / 4.57 BPW` |
 
+## Session 003 — 2026-10-01
+
+**Scope:** Prompt-processing FlashAttention kernel for 256-wide heads on gfx1151 (Qwen3.5/3.8 full-attention layers). On RDNA3.5 these shapes fell through to `flash_attn_tile` (scalar, no WMMA): the WMMA paths stop at head size 128 and the rocWMMA path excludes RDNA3.5.
+
+### `ggml/src/ggml-cuda/fattn-onebit-d256.cu`, `fattn-onebit-d256.cuh` (new)
+
+| Change | Detail |
+|--------|--------|
+| Kernel | 8-wave workgroup = 64 GQA-packed query rows of one KV head; wave pairs split the head dimension (Q slice in registers, 64-register accumulator); 32-token K/V tiles in LDS with a conflict-free V transpose; gfx11 WMMA for Q*K and P*V; base-2 online softmax. |
+| Mask pre-pass | Per query position: first/last finite mask entry and whether the range is all zero. Workgroups visit only the union of their rows' ranges and read the mask only outside the dense intersection. |
+| Scope | RDNA3.5, F32 Q, F16 K/V, head size 256, at least 16 query rows, mask present, no sinks/ALiBi/softcap. `GGML_ONEBIT_FA256=0` disables it. |
+
+### `ggml/src/ggml-cuda/fattn.cu`
+
+| Change | Detail |
+|--------|--------|
+| Hook | Include + 4-line dispatch at the top of the HIP branch of `ggml_cuda_flash_attn_ext`. |
+
+### `tests/test-backend-ops.cpp`
+
+| Change | Detail |
+|--------|--------|
+| Cases | Four FLASH_ATTN_EXT cases at the Qwen3.5/3.8 shape: head 256, GQA 6, KV 4096/16384, batch 16/512. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 -p hsk=256` | 122/122 (kernel on and off) |
+| Qwen3.8-27B UD-Q4_K_XL, llama-bench -b 512 -ub 512 (off -> on) | pp8192 329 -> 348, pp16384 302 -> 334, pp32768 260 -> 310 tok/s |
+| Same, pp512 @ d16384 | 257 -> 307 tok/s; attention-attributable time per token 1.30 -> 0.67 ms |
+| wikitext-2, -c 16384, 2 chunks | PPL 5.4484 (tile kernel 5.5867; HRX backend 5.3543) |
+
+## Session 004 — 2026-10-01
+
+**Scope:** Opt-in sparse prefill for the gfx1151 256-wide-head attention kernel, after FlashPrefill V2 (Fan et al., arXiv:2608.19758), implemented from the paper's equations. Off by default.
+
+### `ggml/src/ggml-cuda/fattn-onebit-d256.cu`
+
+| Change | Detail |
+|--------|--------|
+| `fa256_block_means` | Mean K and V per 128-token block and KV head (16-byte loads over 8 token slots, LDS reduction). |
+| `fa256_select` | Per 64-row query tile: scores every block fully inside the rows' dense visible range against the block-mean keys (same WMMA path as Q*K), accumulates per-block energies with a running maximum, keeps blocks at or above alpha times the largest; the first 256 tokens, the 512 tokens before the diagonal and partially visible blocks are always kept. Writes a keep bitmask per workgroup. |
+| `fa256_prefill<false>` | Dense kernel plus a uniform skip of pruned blocks (keep bits staged in LDS); saves each row's softmax max and sum when sparse. |
+| `fa256_prefill<true>` | Resumes from the output and saved state and adds correction tiles: each pruned block contributes its mean K/V with the logit raised by log2(128). |
+| Switches | `GGML_ONEBIT_FLASH_PREFILL=<alpha>` (0/unset = dense), `GGML_ONEBIT_FLASH_PREFILL_MIN` (KV length, default 8192), diagnostics `_NOCORR=1`, `_STATS=1`. |
+| Register pressure | The tile body is one loop with `if constexpr` per pass; a lambda around it made the compiler spill the accumulators. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-backend-ops -o FLASH_ATTN_EXT -b ROCm0 -p hsk=256` | 122/122 (sparse does not trigger on these random masks; dense path unchanged) |
+| Standalone check vs CPU, 16K KV, block-constant K/V (mean correction exact) | rel. RMS 3.3e-4 at alpha 0.1 and 1.0, same as dense; 0.58 with the correction disabled |
+| Blocks kept at alpha 0.1 | 9-13% at 32K, 31-40% at 16K |
+| llama-server, 8 wikitext prompts of 14-28K tokens, mean prompt tok/s | tile 287, dense kernel 325, alpha 0.1: 347, alpha 0.3: 350 |
+| Passkey retrieval, 10 prompts each at ~16K and ~30K tokens | dense 20/20, alpha 0.1: 20/20, alpha 0.3: 20/20 |
+| Greedy agreement with dense over 128 tokens (8 prompts) | dense repeat 929/929; tile kernel 466/929; alpha 0.1: 93/871 |
+| wikitext-2 PPL, -c 16384, 2 chunks (every scored token from a sparse prefill) | dense 5.4484; alpha 0.1: 5.9256 (5.6062 without correction) |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD
